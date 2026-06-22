@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from slan_cuan.models import ExtractResult, ImageReference, LayerInfo
+from slan_cuan.models import (
+    BuildOutput,
+    ExtractResult,
+    ImageReference,
+    LayerInfo,
+    MavenArtifact,
+    MavenCoordinate,
+    OCIManifest,
+)
 
 
 class TestImageReference:
@@ -238,3 +246,456 @@ class TestExtractResult:
         incomplete.write_text('{"image": {}}')
         with pytest.raises(KeyError):
             ExtractResult.from_file(incomplete)
+
+
+class TestOCIManifest:
+    """Tests for OCIManifest parsing and serialization."""
+
+    def test_from_dict_valid_manifest(self) -> None:
+        """Parse a full manifest dict with all fields."""
+        manifest_data = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.lightwell.build-output.v1+tar",
+            "config": {
+                "mediaType": "application/vnd.oci.empty.v1+json",
+                "digest": "sha256:44136fa",
+                "size": 2,
+            },
+            "layers": [
+                {
+                    "mediaType": ("application/vnd.oci.image.layer.v1.tar+gzip"),
+                    "digest": "sha256:layer1abc",
+                    "size": 1024,
+                    "annotations": {
+                        "io.deis.oras.content.unpack": "true",
+                    },
+                }
+            ],
+            "annotations": {
+                "org.opencontainers.image.title": "TEST-build-output",
+            },
+        }
+
+        manifest = OCIManifest.from_dict(manifest_data)
+
+        assert manifest.deliverable_name == "TEST-build-output"
+        assert len(manifest.layers) == 1
+        assert manifest.layers[0].digest == "sha256:layer1abc"
+        assert manifest.layers[0].size == 1024
+        assert (
+            manifest.layers[0].media_type
+            == "application/vnd.oci.image.layer.v1.tar+gzip"
+        )
+        assert manifest.artifact_type == (
+            "application/vnd.lightwell.build-output.v1+tar"
+        )
+        assert manifest.annotations == {
+            "org.opencontainers.image.title": "TEST-build-output"
+        }
+        assert manifest.raw == manifest_data
+
+    def test_from_dict_fallback_deliverable_name(self) -> None:
+        """Manifest uses deliverable.name when title is missing."""
+        manifest_data = {
+            "layers": [],
+            "annotations": {
+                "deliverable.name": "FALLBACK-build-output",
+            },
+        }
+
+        manifest = OCIManifest.from_dict(manifest_data)
+
+        assert manifest.deliverable_name == "FALLBACK-build-output"
+
+    def test_from_dict_missing_deliverable_name(self) -> None:
+        """Manifest with empty annotations raises ValueError."""
+        manifest_data = {
+            "layers": [],
+            "annotations": {},
+        }
+
+        with pytest.raises(
+            ValueError, match="Could not determine deliverable name"
+        ):
+            OCIManifest.from_dict(manifest_data)
+
+    def test_from_dict_empty_layers(self) -> None:
+        """Manifest with empty layers array."""
+        manifest_data = {
+            "layers": [],
+            "annotations": {
+                "org.opencontainers.image.title": "TEST-build-output",
+            },
+        }
+
+        manifest = OCIManifest.from_dict(manifest_data)
+
+        assert manifest.layers == ()
+
+    def test_to_dict_returns_raw(self) -> None:
+        """to_dict() returns the exact dict passed to from_dict."""
+        manifest_data = {
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:layer1",
+                    "size": 500,
+                }
+            ],
+            "annotations": {
+                "org.opencontainers.image.title": "TEST-build-output",
+            },
+        }
+
+        manifest = OCIManifest.from_dict(manifest_data)
+
+        assert manifest.to_dict() is manifest_data
+
+    def test_direct_construction(self) -> None:
+        """Construct OCIManifest directly with all fields."""
+        raw_data = {"test": "data"}
+        layer = LayerInfo(
+            digest="sha256:abc123",
+            media_type="application/vnd.oci.image.layer.v1.tar",
+            size=1000,
+            annotations={},
+        )
+
+        manifest = OCIManifest(
+            deliverable_name="DIRECT-build-output",
+            layers=(layer,),
+            annotations={"key": "value"},
+            artifact_type="application/vnd.lightwell.build-output.v1+tar",
+            raw=raw_data,
+        )
+
+        assert manifest.deliverable_name == "DIRECT-build-output"
+        assert len(manifest.layers) == 1
+        assert manifest.layers[0].digest == "sha256:abc123"
+        assert manifest.annotations == {"key": "value"}
+        assert manifest.artifact_type == (
+            "application/vnd.lightwell.build-output.v1+tar"
+        )
+        assert manifest.raw is raw_data
+
+    def test_layer_annotations_preserved(self) -> None:
+        """Parse manifest with layer-level annotations."""
+        manifest_data = {
+            "layers": [
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": "sha256:layer1",
+                    "size": 1024,
+                    "annotations": {
+                        "io.deis.oras.content.unpack": "true",
+                        "custom.annotation": "value",
+                    },
+                }
+            ],
+            "annotations": {
+                "org.opencontainers.image.title": "TEST-build-output",
+            },
+        }
+
+        manifest = OCIManifest.from_dict(manifest_data)
+
+        assert len(manifest.layers) == 1
+        assert "io.deis.oras.content.unpack" in manifest.layers[0].annotations
+        assert (
+            manifest.layers[0].annotations["io.deis.oras.content.unpack"]
+            == "true"
+        )
+        assert "custom.annotation" in manifest.layers[0].annotations
+        assert manifest.layers[0].annotations["custom.annotation"] == "value"
+
+
+class TestMavenArtifact:
+    """Tests for MavenArtifact properties and methods."""
+
+    def test_coordinate_property(self, tmp_path: Path) -> None:
+        """Coordinate property returns MavenCoordinate with GAV."""
+        artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.jar",
+            file_path=tmp_path / "artifact-1.0.0.jar",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="jar",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+
+        coord = artifact.coordinate
+
+        assert isinstance(coord, MavenCoordinate)
+        assert coord.group_id == "org.example"
+        assert coord.artifact_id == "artifact"
+        assert coord.version == "1.0.0"
+
+    def test_is_signable_jar(self, tmp_path: Path) -> None:
+        """JAR artifacts are signable."""
+        artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.jar",
+            file_path=tmp_path / "artifact-1.0.0.jar",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="jar",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+
+        assert artifact.is_signable is True
+
+    def test_is_signable_pom(self, tmp_path: Path) -> None:
+        """POM artifacts are signable."""
+        artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.pom",
+            file_path=tmp_path / "artifact-1.0.0.pom",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="pom",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+
+        assert artifact.is_signable is True
+
+    def test_is_not_signable_md5(self, tmp_path: Path) -> None:
+        """Checksum sidecar files are not signable."""
+        artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.jar.md5",
+            file_path=tmp_path / "artifact-1.0.0.jar.md5",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="md5",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+
+        assert artifact.is_signable is False
+
+
+class TestBuildOutput:
+    """Tests for BuildOutput parsing and properties."""
+
+    def test_from_extract_result(self, tmp_path: Path) -> None:
+        """Parse deliverable directory using ExtractResult."""
+        # Create filesystem layout
+        deliverable_dir = tmp_path / "TEST-build-output"
+        repo_dir = deliverable_dir / "repository" / "org" / "example"
+        version_dir = repo_dir / "artifact" / "1.0.0"
+        version_dir.mkdir(parents=True)
+
+        # Create artifacts
+        (version_dir / "artifact-1.0.0.jar").write_text("jar content")
+        (version_dir / "artifact-1.0.0.pom").write_text("<project/>")
+        (version_dir / "artifact-1.0.0-sources.jar").write_text("sources")
+
+        # Create checksum sidecars
+        (version_dir / "artifact-1.0.0.jar.md5").write_text("abc123")
+        (version_dir / "artifact-1.0.0.jar.sha1").write_text("def456")
+        (version_dir / "artifact-1.0.0.jar.sha256").write_text("789ghi")
+
+        # Create well-known files
+        (deliverable_dir / "cyclonedx.json").write_text("{}")
+        (deliverable_dir / "provenance.json").write_text("{}")
+
+        # Create ExtractResult
+        result = ExtractResult(
+            image=ImageReference(
+                registry="quay.io",
+                repository="test/image",
+                tag=None,
+                digest="sha256:abc123",
+            ),
+            manifest_digest="sha256:manifest123",
+            layers=[],
+            annotations={},
+            deliverable_dir="TEST-build-output",
+            files=[],
+            extracted_at="2026-06-19T12:00:00Z",
+        )
+
+        build = BuildOutput.from_extract_result(result, tmp_path)
+
+        # Verify build_id extraction
+        assert build.build_id == "TEST"
+
+        # Verify artifacts count (jar, pom, sources.jar — no checksums)
+        assert len(build.artifacts) == 3
+
+        # Verify at least one artifact has correct GAV
+        jar_artifact = next(
+            a
+            for a in build.artifacts
+            if a.extension == "jar" and not a.classifier
+        )
+        assert jar_artifact.group_id == "org.example"
+        assert jar_artifact.artifact_id == "artifact"
+        assert jar_artifact.version == "1.0.0"
+
+        # Verify checksums read from sidecars
+        assert jar_artifact.md5 == "abc123"
+        assert jar_artifact.sha1 == "def456"
+        assert jar_artifact.sha256 == "789ghi"
+
+        # Verify sources jar has classifier
+        sources_artifact = next(
+            a for a in build.artifacts if a.classifier == "sources"
+        )
+        assert sources_artifact.extension == "jar"
+
+        # Verify well-known files
+        assert build.sbom_path is not None
+        assert build.sbom_path.exists()
+        assert build.provenance_path is not None
+        assert build.provenance_path.exists()
+        assert build.source_archive_path is None
+
+    def test_coordinates_dedup(self, tmp_path: Path) -> None:
+        """Coordinates property deduplicates GAVs."""
+        artifact1 = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.jar",
+            file_path=tmp_path / "artifact-1.0.0.jar",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="jar",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+        artifact2 = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.pom",
+            file_path=tmp_path / "artifact-1.0.0.pom",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="pom",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+
+        build = BuildOutput(
+            build_id="TEST",
+            deliverable_dir=tmp_path,
+            artifacts=(artifact1, artifact2),
+            sbom_path=None,
+            provenance_path=None,
+            source_archive_path=None,
+        )
+
+        # Two artifacts with same GAV should result in one coordinate
+        assert len(build.coordinates) == 1
+        coord = next(iter(build.coordinates))
+        assert coord.group_id == "org.example"
+        assert coord.artifact_id == "artifact"
+        assert coord.version == "1.0.0"
+
+    def test_signable_filter(self, tmp_path: Path) -> None:
+        """Signable property filters JARs and POMs."""
+        jar_artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.jar",
+            file_path=tmp_path / "artifact-1.0.0.jar",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="jar",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+        pom_artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.pom",
+            file_path=tmp_path / "artifact-1.0.0.pom",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="pom",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+        md5_artifact = MavenArtifact(
+            relative_path="org/example/artifact/1.0.0/artifact-1.0.0.jar.md5",
+            file_path=tmp_path / "artifact-1.0.0.jar.md5",
+            group_id="org.example",
+            artifact_id="artifact",
+            version="1.0.0",
+            classifier=None,
+            extension="md5",
+            md5=None,
+            sha1=None,
+            sha256=None,
+        )
+
+        build = BuildOutput(
+            build_id="TEST",
+            deliverable_dir=tmp_path,
+            artifacts=(jar_artifact, pom_artifact, md5_artifact),
+            sbom_path=None,
+            provenance_path=None,
+            source_archive_path=None,
+        )
+
+        # Only jar and pom should be signable
+        assert len(build.signable) == 2
+        assert jar_artifact in build.signable
+        assert pom_artifact in build.signable
+        assert md5_artifact not in build.signable
+
+    def test_classifier_detection(self, tmp_path: Path) -> None:
+        """Classifier is correctly extracted from filename."""
+        # Create filesystem layout
+        deliverable_dir = tmp_path / "TEST-build-output"
+        repo_dir = deliverable_dir / "repository" / "org" / "example"
+        version_dir = repo_dir / "artifact" / "1.0.0"
+        version_dir.mkdir(parents=True)
+
+        # Create artifacts with and without classifier
+        (version_dir / "artifact-1.0.0.jar").write_text("primary jar")
+        (version_dir / "artifact-1.0.0-javadoc.jar").write_text("javadoc")
+
+        result = ExtractResult(
+            image=ImageReference(
+                registry="quay.io",
+                repository="test/image",
+                tag=None,
+                digest="sha256:abc123",
+            ),
+            manifest_digest="sha256:manifest123",
+            layers=[],
+            annotations={},
+            deliverable_dir="TEST-build-output",
+            files=[],
+            extracted_at="2026-06-19T12:00:00Z",
+        )
+
+        build = BuildOutput.from_extract_result(result, tmp_path)
+
+        # Find javadoc jar
+        javadoc_jar = next(
+            a for a in build.artifacts if a.classifier == "javadoc"
+        )
+        assert javadoc_jar.extension == "jar"
+
+        # Find primary jar
+        primary_jar = next(a for a in build.artifacts if a.classifier is None)
+        assert primary_jar.extension == "jar"

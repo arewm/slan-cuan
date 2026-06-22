@@ -11,7 +11,11 @@ from pathlib import Path
 import click
 
 from slan_cuan.context import GlobalContext
-from slan_cuan.models import ExtractResult, ImageReference, LayerInfo
+from slan_cuan.models import (
+    ExtractResult,
+    ImageReference,
+    OCIManifest,
+)
 from slan_cuan.oci import OrasError, manifest_fetch, pull
 
 
@@ -69,11 +73,17 @@ def extract(
         if ctx.verbose:
             click.echo(f"Fetching manifest for {img_ref}...")
 
-        manifest = manifest_fetch(
+        raw_manifest = manifest_fetch(
             img_ref,
             auth_file=registry_auth_file,
             verbose=ctx.verbose,
         )
+
+        # Parse manifest using OCIManifest model
+        manifest = OCIManifest.from_dict(raw_manifest)
+        deliverable_name = manifest.deliverable_name
+        layers = list(manifest.layers)
+        annotations = manifest.annotations
 
         # Extract manifest digest
         # For digest-based refs, use the digest from the ref
@@ -83,33 +93,10 @@ def extract(
         else:
             # Calculate SHA256 digest of the manifest JSON
             manifest_bytes = json.dumps(
-                manifest, separators=(",", ":"), sort_keys=True
+                raw_manifest, separators=(",", ":"), sort_keys=True
             ).encode("utf-8")
             digest_hash = hashlib.sha256(manifest_bytes).hexdigest()
             manifest_digest = f"sha256:{digest_hash}"
-
-        # Extract layer information
-        layers = [
-            LayerInfo(
-                digest=layer["digest"],
-                media_type=layer["mediaType"],
-                size=layer["size"],
-            )
-            for layer in manifest.get("layers", [])
-        ]
-
-        # Extract annotations
-        annotations = manifest.get("annotations", {})
-
-        # Determine deliverable directory name from annotations
-        deliverable_name = annotations.get(
-            "org.opencontainers.image.title"
-        ) or annotations.get("deliverable.name")
-
-        if not deliverable_name:
-            raise click.ClickException(
-                "Could not determine deliverable name from manifest annotations"
-            )
 
         # Dry-run path: display metadata and exit
         if ctx.dry_run:
@@ -143,7 +130,7 @@ def extract(
         if ctx.verbose:
             click.echo(f"Saving manifest to {manifest_path}")
         with manifest_path.open("w") as f:
-            json.dump(manifest, f, indent=2)
+            json.dump(manifest.to_dict(), f, indent=2)
 
         # Pull the artifact
         if ctx.verbose:

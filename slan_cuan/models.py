@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -98,6 +98,272 @@ class LayerInfo:
     digest: str
     media_type: str
     size: int
+    annotations: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OCIManifest:
+    """Parsed OCI image manifest from oras manifest fetch."""
+
+    deliverable_name: str
+    layers: tuple[LayerInfo, ...]
+    annotations: dict[str, str]
+    artifact_type: str
+    raw: dict[str, object]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> OCIManifest:
+        """Parse raw oras manifest-fetch JSON.
+
+        Raises:
+            ValueError: If deliverable name cannot be determined.
+
+        """
+        # Parse layers
+        layers_data = data.get("layers", [])
+        if not isinstance(layers_data, list):
+            layers_data = []
+
+        layers = tuple(
+            LayerInfo(
+                digest=str(layer["digest"]),
+                media_type=str(layer["mediaType"]),
+                size=int(layer["size"]),
+                annotations=dict(layer.get("annotations", {})),
+            )
+            for layer in layers_data
+            if isinstance(layer, dict)
+        )
+
+        # Parse annotations
+        annotations_data = data.get("annotations", {})
+        if not isinstance(annotations_data, dict):
+            annotations_data = {}
+        annotations = {str(k): str(v) for k, v in annotations_data.items()}
+
+        # Resolve deliverable name (title annotation preferred, fallback
+        # to deliverable.name)
+        deliverable_name_raw = annotations.get(
+            "org.opencontainers.image.title"
+        ) or annotations.get("deliverable.name")
+
+        if not deliverable_name_raw:
+            raise ValueError(
+                "Could not determine deliverable name from manifest annotations"
+            )
+
+        return cls(
+            deliverable_name=str(deliverable_name_raw),
+            layers=layers,
+            annotations=annotations,
+            artifact_type=str(data.get("artifactType", "")),
+            raw=data,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the original manifest dict for serialization."""
+        return self.raw
+
+
+def _parse_extension(filename: str) -> str:
+    """Extract the file extension for Maven artifact classification."""
+    if filename.endswith(".tar.gz"):
+        return "tar.gz"
+    return filename.rsplit(".", 1)[-1] if "." in filename else ""
+
+
+def _parse_classifier(
+    filename: str, artifact_id: str, version: str
+) -> str | None:
+    """Extract Maven classifier from filename.
+
+    Classifier appears between version and extension:
+    artifact_id-version[-classifier].extension
+
+    """
+    prefix = f"{artifact_id}-{version}"
+    if not filename.startswith(prefix):
+        return None
+    remainder = filename[len(prefix) :]
+    if not remainder or remainder[0] == ".":
+        return None
+    # remainder starts with "-classifier.ext"
+    if remainder[0] != "-":
+        return None
+    # Strip leading dash and extension
+    classifier_with_ext = remainder[1:]
+
+    # Handle .tar.gz extension specially
+    if classifier_with_ext.endswith(".tar.gz"):
+        classifier = classifier_with_ext[:-7]  # Remove ".tar.gz"
+    elif "." in classifier_with_ext:
+        classifier = classifier_with_ext.rsplit(".", 1)[0]
+    else:
+        classifier = classifier_with_ext
+
+    return classifier if classifier else None
+
+
+def _read_sidecar(file_path: Path, suffix: str) -> str | None:
+    """Read checksum value from sidecar file if it exists."""
+    sidecar_path = file_path.parent / f"{file_path.name}{suffix}"
+    if sidecar_path.exists():
+        content = sidecar_path.read_text().strip()
+        # Checksum files often have format: "checksum filename"
+        if content:
+            parts = content.split()
+            return parts[0] if parts else None
+    return None
+
+
+@dataclass(frozen=True)
+class MavenCoordinate:
+    """Maven GAV coordinate."""
+
+    group_id: str
+    artifact_id: str
+    version: str
+
+
+@dataclass(frozen=True)
+class MavenArtifact:
+    """A single uploadable Maven artifact.
+
+    Fields map to Pulp Maven upload API parameters.
+
+    """
+
+    relative_path: str
+    file_path: Path
+    group_id: str
+    artifact_id: str
+    version: str
+    classifier: str | None
+    extension: str
+    md5: str | None
+    sha1: str | None
+    sha256: str | None
+
+    @property
+    def coordinate(self) -> MavenCoordinate:
+        """Return the GAV coordinate for this artifact."""
+        return MavenCoordinate(
+            group_id=self.group_id,
+            artifact_id=self.artifact_id,
+            version=self.version,
+        )
+
+    @property
+    def is_signable(self) -> bool:
+        """True for JARs and POMs (sign stage filter)."""
+        return self.extension in ("jar", "pom")
+
+
+@dataclass(frozen=True)
+class BuildOutput:
+    """Parsed PNC build-output deliverable."""
+
+    build_id: str
+    deliverable_dir: Path
+    artifacts: tuple[MavenArtifact, ...]
+    sbom_path: Path | None
+    provenance_path: Path | None
+    source_archive_path: Path | None
+
+    @property
+    def coordinates(self) -> frozenset[MavenCoordinate]:
+        """Unique GAV coordinates across all artifacts."""
+        return frozenset(a.coordinate for a in self.artifacts)
+
+    @property
+    def signable(self) -> tuple[MavenArtifact, ...]:
+        """Artifacts eligible for signing (JARs + POMs)."""
+        return tuple(a for a in self.artifacts if a.is_signable)
+
+    @classmethod
+    def from_extract_result(
+        cls,
+        result: ExtractResult,
+        output_dir: Path,
+    ) -> BuildOutput:
+        """Parse deliverable directory using ExtractResult metadata.
+
+        Walks repository/ tree, parses GAV from paths, reads
+        checksum sidecars, determines classifiers from filenames.
+
+        """
+        deliverable_path = output_dir / result.deliverable_dir
+        repo_dir = deliverable_path / "repository"
+
+        # Extract build_id from deliverable dir name
+        # e.g. "BPQESYGN2PQAA-build-output" -> "BPQESYGN2PQAA"
+        parts = result.deliverable_dir.split("-", 1)
+        build_id = parts[0] if parts else result.deliverable_dir
+
+        artifacts: list[MavenArtifact] = []
+
+        if repo_dir.is_dir():
+            for file_path in sorted(repo_dir.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                # Skip checksum sidecar files
+                if file_path.suffix in (".md5", ".sha1", ".sha256"):
+                    continue
+
+                rel_to_repo = file_path.relative_to(repo_dir)
+                parts_list = list(rel_to_repo.parts)
+
+                # Need at least: group/artifact_id/version/filename (4 parts)
+                if len(parts_list) < 4:
+                    continue
+
+                filename = parts_list[-1]
+                version = parts_list[-2]
+                artifact_id = parts_list[-3]
+                group_id = ".".join(parts_list[:-3])
+
+                if not group_id:
+                    continue
+
+                # Determine extension and classifier
+                extension = _parse_extension(filename)
+                classifier = _parse_classifier(filename, artifact_id, version)
+
+                # Read checksum sidecars
+                md5 = _read_sidecar(file_path, ".md5")
+                sha1_val = _read_sidecar(file_path, ".sha1")
+                sha256_val = _read_sidecar(file_path, ".sha256")
+
+                artifacts.append(
+                    MavenArtifact(
+                        relative_path=str(rel_to_repo),
+                        file_path=file_path,
+                        group_id=group_id,
+                        artifact_id=artifact_id,
+                        version=version,
+                        classifier=classifier,
+                        extension=extension,
+                        md5=md5,
+                        sha1=sha1_val,
+                        sha256=sha256_val,
+                    )
+                )
+
+        # Locate well-known files
+        sbom_path = deliverable_path / "cyclonedx.json"
+        provenance_path = deliverable_path / "provenance.json"
+        sources_path = deliverable_path / "sources" / "sources.tar.gz"
+
+        return cls(
+            build_id=build_id,
+            deliverable_dir=deliverable_path,
+            artifacts=tuple(artifacts),
+            sbom_path=sbom_path if sbom_path.exists() else None,
+            provenance_path=(
+                provenance_path if provenance_path.exists() else None
+            ),
+            source_archive_path=(sources_path if sources_path.exists() else None),
+        )
 
 
 @dataclass(frozen=True)
@@ -163,6 +429,7 @@ class ExtractResult:
                 digest=layer["digest"],
                 media_type=layer["media_type"],
                 size=layer["size"],
+                annotations=layer.get("annotations", {}),
             )
             for layer in data["layers"]
         ]
