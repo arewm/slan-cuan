@@ -1,6 +1,4 @@
-FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
-
-ARG RH_IT_CERT
+FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 
 # Install the builder dependencies
 RUN dnf -y install \
@@ -19,15 +17,12 @@ RUN dnf -y install \
 COPY . /src/
 WORKDIR /src
 
-# Authenticate in the internal git repository to fetch the dependencies such as novabucks
-# and generate the wheels
-RUN echo ${RH_IT_CERT} > /etc/pki/ca-trust/source/anchors/Current-IT-Root-CAs.pem \
-    && update-ca-trust extract \
-    &&  pip3.12 wheel --wheel-dir=/export/wheels .
+# Generate the wheels
+RUN pip3.12 wheel --wheel-dir=/export/wheels .
 
 
-# Build the final image using ubi-minimal to reduce the image size
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# Build the final image using task-runner which includes oras and other Tekton tooling
+FROM quay.io/konflux-ci/task-runner:1.5.0
 
 LABEL \
     name="slan-cuan" \
@@ -37,11 +32,10 @@ LABEL \
 # Copy the wheels from the builder stage
 COPY --from=builder /export/ /
 
-# Setup RH-IT-Root-CA certificate for RedHat
-RUN echo ${RH_IT_CERT} > /etc/pki/ca-trust/source/anchors/Current-IT-Root-CAs.pem \
-    && update-ca-trust extract \
-    # Install dependencies
-    && microdnf install -y \
+USER 0
+
+# Install dependencies
+RUN microdnf install -y \
         python3.12-pip \
     # for CVEs in base image
     && microdnf update -y \

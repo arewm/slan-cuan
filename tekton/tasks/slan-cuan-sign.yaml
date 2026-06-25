@@ -102,7 +102,7 @@ spec:
         - name: caCertPath
           value: /mnt/trusted-ca/$(params.caTrustConfigMapKey)
     - name: run
-      image: quay.io/light-castle/slan-cuan:latest
+      image: quay.io/light-castle/slan-cuan:v0.2.0@sha256:caec115db8e741a6b2f37922f3a217375a8f80d07cd8e901f6274d704d523e7e
       args:
         - sign
       env:
